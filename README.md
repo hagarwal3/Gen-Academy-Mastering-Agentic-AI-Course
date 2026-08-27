@@ -1,0 +1,1 @@
+The files in this repository are related to masterining agentic AI course by Gen Academy where I have uploaded various projects related to basic RAG, agentic RAG, multiple agents, and complex workflow. You can follow along these projects to become a master in agentic AI.
