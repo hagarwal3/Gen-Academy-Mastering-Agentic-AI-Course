@@ -1,0 +1,158 @@
+#import
+import os
+import json
+import time
+from pathlib import Path
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import OpenAIEmbeddings
+from openai import RateLimitError
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone, ServerlessSpec
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+
+# dotenv.env holds the API keys; not named ".env" so pass the path explicitly.
+load_dotenv(dotenv_path=Path(__file__).parent / "dotenv.env", override=True)
+
+#define the embeddings model (Nebius Token Factory, OpenAI-compatible API)
+embeddings = OpenAIEmbeddings(
+    model="Qwen/Qwen3-Embedding-8B",
+    base_url="https://api.tokenfactory.nebius.com/v1/",
+    api_key=os.environ["NEBIUS_API_KEY"],
+    check_embedding_ctx_length=False,  # Nebius rejects OpenAI's tiktoken-pretokenized input
+)
+
+#connect to Pinecone, creating the index if it doesn't exist yet
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+index_name = os.environ["PINECONE_INDEX_NAME"]
+embedding_dim = 4096  # must match the embeddings model above
+
+existing_indexes = {idx["name"]: idx for idx in pc.list_indexes()}
+if index_name in existing_indexes and existing_indexes[index_name]["dimension"] != embedding_dim:
+    pc.delete_index(index_name)
+    del existing_indexes[index_name]
+
+if index_name not in existing_indexes:
+    pc.create_index(
+        name=index_name,
+        dimension=embedding_dim,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    )
+    while not pc.describe_index(index_name).status["ready"]:
+        time.sleep(1)
+
+index = pc.Index(index_name)
+vector_store = PineconeVectorStore(
+    index=index,
+    embedding=embeddings,
+    namespace="FDA-Warning-Letter-RAG",
+)
+
+# Only ingest if the index/namespace is empty, so asking questions interactively
+# doesn't re-embed and re-upsert all chunks (and rack up duplicates) every run.
+stats = index.describe_index_stats()
+already_ingested = stats.namespaces.get("FDA-Warning-Letter-RAG", {}).get("vector_count", 0) > 0
+
+if not already_ingested:
+    #Ingest a folder of HTML files into LangChain Document objects.
+    # Extract only the role="main" content (the actual letter body) so nav/footer
+    # boilerplate ("Content current as of...", "Contact FDA", "FDA Archive", etc.,
+    # which is near-identical across every letter) never gets embedded and doesn't
+    # crowd out real content in similarity search.
+    from bs4 import BeautifulSoup
+
+    folder_path = Path(r"C:\Users\har09\fda_warning_letters\docs\2026")
+    docs = []
+    for html_path in sorted(folder_path.glob("*.html")):
+        with open(html_path, "r", encoding="utf-8") as f:
+            soup = BeautifulSoup(f, "lxml")
+        main = soup.find(attrs={"role": "main"}) or soup
+        title = str(soup.title.string) if soup.title else ""
+        docs.append(
+            Document(
+                page_content=main.get_text(separator=" ", strip=True),
+                metadata={"source": str(html_path), "title": title},
+            )
+        )
+    print(f"Loaded {len(docs)} documents")
+
+    #Chuncking the documents into smaller pieces for better processing.
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        add_start_index=True,
+    )
+    splits = text_splitter.split_documents(docs)
+    print(f"Documents in:  {len(docs)}")
+    print(f"Chunks out:    {len(splits)}")
+    print("-" * 100)
+
+    # This process will convert each chunk into a vector and store it in the database.
+    # Uploaded in small batches with pacing, retrying on rate-limit errors from the
+    # Nebius Token Factory API.
+    upload_batch_size = 20
+    document_ids: list[str] = []
+    for i in range(0, len(splits), upload_batch_size):
+        batch = splits[i : i + upload_batch_size]
+        for attempt in range(5):
+            try:
+                document_ids.extend(vector_store.add_documents(documents=batch))
+                break
+            except RateLimitError as e:
+                wait = 20 * (attempt + 1)
+                print(f"Rate limited on batch {i}-{i + len(batch)}, retrying in {wait}s ({e})")
+                time.sleep(wait)
+        else:
+            raise RuntimeError(f"Failed to embed batch {i}-{i + len(batch)} after retries")
+        print(f"  upserted {len(document_ids)}/{len(splits)} chunks so far")
+        time.sleep(2)  # pace batches to stay under the per-minute quota
+    print(f"Upserted {len(document_ids)} chunks into Pinecone index '{index_name}'")
+else:
+    print(f"Index '{index_name}' already has {stats.namespaces['FDA-Warning-Letter-RAG']['vector_count']} vectors, skipping ingestion.")
+
+#configure the llm (free tier)
+llm = ChatGoogleGenerativeAI(model="models/gemini-3.6-flash")
+
+#set the prompt template
+template = """You are a regulatory intelligence analyst working with a corpus of FDA Warning
+Letters. You answer questions about what FDA has cited, using only the letters
+supplied to you in the CONTEXT block.
+
+CONTEXT:
+{context}
+
+Question: {question}
+Answer:"""
+
+rag_prompt_template = PromptTemplate.from_template(template)
+
+
+def generate_answer(user_question):
+    #retrieve the relevant docs
+    retriever = vector_store.as_retriever(search_kwargs={"k": 5}, search_type='similarity')
+    retrieved_docs = retriever.invoke(user_question)
+
+    #generate
+    docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
+    prompt = rag_prompt_template.invoke({"question": user_question, "context": docs_content})
+    response = llm.invoke(prompt)
+
+    # Newer Gemini models return content as a list of blocks (text + signature
+    # metadata) instead of a plain string; extract just the text.
+    if isinstance(response.content, list):
+        return "".join(
+            block.get("text", "") for block in response.content if isinstance(block, dict)
+        )
+    return response.content
+
+
+if __name__ == "__main__":
+    print("\nAsk a question about the FDA warning letters (blank line or 'exit' to quit).")
+    while True:
+        user_question = input("\n> ").strip()
+        if not user_question or user_question.lower() in ("exit", "quit"):
+            break
+        print(generate_answer(user_question))
